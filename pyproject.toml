@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "granite-oscar-kv-quant"
+version = "0.1.0"
+description = "IBM Granite adapter for OScaR-KV-Quant KV-cache quantization"
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+  "accelerate>=0.33",
+  "huggingface-hub>=0.24",
+  "pydantic>=2.8",
+  "sentencepiece>=0.2",
+  "torch>=2.6",
+  "transformers>=4.56",
+]
+
+[project.scripts]
+granite-oscar-baseline = "granite_oscar_quant.benchmark:main"
+granite-oscar-generate = "granite_oscar_quant.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
