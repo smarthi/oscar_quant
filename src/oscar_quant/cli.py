@@ -1,9 +1,9 @@
-"""Command-line generation entry point for Granite with OScaR KV quantization.
+"""Command-line generation entry point for OScaR KV quantization.
 
-This module loads a Hugging Face Granite causal language model, patches its
-attention layers in place, and then runs a single text-generation request. It is
-the shortest end-to-end path for checking that OScaR is installed and that the
-Granite attention adapter can participate in normal `model.generate` flows.
+This module loads a supported Hugging Face model, applies its runtime OScaR
+attention patch, and then runs a single text-generation request. It is the
+shortest end-to-end path for checking that OScaR is installed and that the
+model-family adapter can participate in normal `model.generate` flows.
 """
 
 from __future__ import annotations
@@ -15,17 +15,17 @@ from typing import Any
 import torch
 
 from .config import OscarKVConfig
-from .loader import load_oscar_patched_granite
-from .models import DEFAULT_GRANITE_MODEL_ID
+from .loader import load_oscar_patched_gemma4, load_oscar_patched_granite
+from .models import DEFAULT_GEMMA4_E2B_MODEL_ID, DEFAULT_GRANITE_MODEL_ID, ModelProfileName
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run one OScaR-patched Granite generation request.
+    """Run one OScaR-patched generation request.
 
     What it does:
-        Parses CLI arguments, loads the tokenizer/model, applies the OScaR
-        attention patch, tokenizes the prompt, generates new tokens, and prints
-        the decoded continuation.
+        Parses CLI arguments, loads the processor-or-tokenizer/model pair,
+        applies the selected model family's OScaR attention patch, tokenizes the
+        prompt, generates new tokens, and prints the decoded continuation.
 
     Why it exists:
         Users need a direct smoke test before investing in longer benchmark
@@ -34,32 +34,22 @@ def main(argv: list[str] | None = None) -> int:
 
     How it helps:
         A successful run proves three things at once: the model can load, the
-        correct Granite attention modules can be found, and OScaR can quantize
-        the KV cache during generation.
+        correct attention modules can be found, and OScaR can quantize the KV
+        cache during generation.
     """
     args = _parse_args(argv)
     dtype = _dtype(args.dtype)
 
-    patched_granite = load_oscar_patched_granite(
-        args.model_id,
-        torch_dtype=dtype,
-        device_map=args.device_map,
-        attn_implementation="eager",
-        trust_remote_code=args.trust_remote_code,
-        kv_config=_oscar_config(args),
-    )
+    model_id = _resolved_model_id(args.profile, args.model_id)
+    patched_model = _load_patched_model(args.profile, model_id, dtype, args)
     print(
-        f"patched_granite_attention_layers={patched_granite.patched_attention_layers}",
+        f"patched_{args.profile}_attention_layers={patched_model.patched_attention_layers}",
         file=sys.stderr,
     )
 
     prompt = args.prompt
     if args.chat_template:
-        prompt = patched_granite.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+        prompt = _apply_chat_template(patched_model, prompt)
 
     generate_kwargs: dict[str, Any] = {
         "max_new_tokens": args.max_new_tokens,
@@ -72,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    print(patched_granite.generate_text(prompt, **generate_kwargs))
+    print(patched_model.generate_text(prompt, **generate_kwargs))
 
     if torch.cuda.is_available():
         peak_gib = torch.cuda.max_memory_allocated() / 1024**3
@@ -96,8 +86,9 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         The parsed namespace can be passed to `_dtype` and `_oscar_config`,
         avoiding duplicate parsing logic in the main execution path.
     """
-    parser = argparse.ArgumentParser(description="Run IBM Granite with OScaR KV-cache quantization.")
-    parser.add_argument("--model-id", default=DEFAULT_GRANITE_MODEL_ID)
+    parser = argparse.ArgumentParser(description="Run a supported model with OScaR KV-cache quantization.")
+    parser.add_argument("--profile", choices=("granite-4.0-1b-base", "gemma4-e2b"), default="granite-4.0-1b-base")
+    parser.add_argument("--model-id", default=None)
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--dtype", choices=("auto", "bfloat16", "float16", "float32"), default="auto")
@@ -120,6 +111,89 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--disable-hadamard", action="store_true")
     parser.add_argument("--disable-offline-v-hadamard", action="store_true")
     return parser.parse_args(argv)
+
+
+def _resolved_model_id(profile: ModelProfileName, model_id: str | None) -> str:
+    """Return the model id selected by a profile plus optional override.
+
+    What it does:
+        Uses an explicit `--model-id` when provided, otherwise returns the
+        built-in Hugging Face id for the requested profile.
+
+    Why it exists:
+        Granite and Gemma4 have different defaults, but the CLI should keep one
+        consistent `--model-id` override flag.
+
+    How it helps:
+        Users can switch from Granite to Gemma4 with only `--profile gemma4-e2b`
+        while advanced users can still point at local or fine-tuned checkpoints.
+    """
+    if model_id is not None:
+        return model_id
+    if profile == "gemma4-e2b":
+        return DEFAULT_GEMMA4_E2B_MODEL_ID
+    return DEFAULT_GRANITE_MODEL_ID
+
+
+def _load_patched_model(
+    profile: ModelProfileName,
+    model_id: str,
+    dtype: str | torch.dtype,
+    args: argparse.Namespace,
+) -> Any:
+    """Load and patch the selected runtime model family.
+
+    What it does:
+        Dispatches to the Granite or Gemma4 high-level loader with the shared
+        dtype, device map, trust flag, eager attention implementation, and
+        validated OScaR config.
+
+    Why it exists:
+        The generation CLI is shared, but runtime attention patching is
+        intentionally model-family-specific.
+
+    How it helps:
+        One command can smoke-test both supported OScaR adapters without hiding
+        the fact that Granite and Gemma4 use different loader classes.
+    """
+    loader = load_oscar_patched_gemma4 if profile == "gemma4-e2b" else load_oscar_patched_granite
+    return loader(
+        model_id,
+        torch_dtype=dtype,
+        device_map=args.device_map,
+        attn_implementation="eager",
+        trust_remote_code=args.trust_remote_code,
+        kv_config=_oscar_config(args),
+    )
+
+
+def _apply_chat_template(patched_model: Any, prompt: str) -> str:
+    """Apply a chat template using whichever tokenizer-like object is present.
+
+    What it does:
+        Finds a tokenizer on the patched wrapper, either directly for Granite or
+        through the Gemma4 processor, and calls `apply_chat_template`.
+
+    Why it exists:
+        The two supported loaders expose preprocessing assets differently, but
+        chat-template prompting is a model-facing concern rather than a patching
+        concern.
+
+    How it helps:
+        The CLI can keep one `--chat-template` flag for both Granite and Gemma4
+        without duplicating generation setup.
+    """
+    tokenizer = getattr(patched_model, "tokenizer", None)
+    if tokenizer is None:
+        processor = getattr(patched_model, "processor", None)
+        tokenizer = getattr(processor, "tokenizer", processor)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        raise ValueError("The selected model assets do not expose apply_chat_template.")
+    return tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
 
 
 def _dtype(name: str) -> str | torch.dtype:

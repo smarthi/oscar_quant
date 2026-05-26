@@ -1,130 +1,88 @@
-# Granite Quantization Tools
+# Oscar Quant
 
-This project now supports two related but different outputs for IBM Granite 4.0
-1B Base:
+`oscar_quant` is a Python 3.12+ project for two related but different
+quantization jobs:
 
-1. A **persistent quantized weight artifact** saved as Hugging Face
-   `.safetensors` files.
-2. An **in-memory OScaR KV-cache patched Granite model** for runtime generation.
+1. **Runtime OScaR KV-cache quantization** for supported generation models.
+2. **Persistent `.safetensors` weight artifacts** using Hugging Face
+   Transformers plus TorchAO.
 
-The file-producing path is the one to use when you want a quantized model
-directory on disk:
+The runtime OScaR path now supports:
 
-```bash
-granite-quantize-weights \
-  --output-dir artifacts/granite-4.0-1b-base-int4 \
-  --quantization int4_weight_only \
-  --group-size 128 \
-  --dtype bfloat16 \
-  --device-map auto
-```
+| Profile | Model ID | Runtime patch | Loader |
+| --- | --- | --- | --- |
+| `granite-4.0-1b-base` | `ibm-granite/granite-4.0-1b-base` | `GraniteAttention` / `GraniteMoeHybridAttention` | `AutoModelForCausalLM` |
+| `gemma4-e2b` | `google/gemma-4-E2B` | `Gemma4TextAttention` | `AutoModelForImageTextToText` |
 
-That command writes a Hugging Face-compatible directory containing model config,
-tokenizer files, and one or more `.safetensors` weight files.
+The file-producing TorchAO artifact path supports the same profiles.
 
-## What This Produces
+## Quick Mental Model
 
-The main artifact output looks like this:
+OScaR KV-cache quantization and `.safetensors` weight quantization are not the
+same output.
+
+Runtime OScaR:
+
+1. Loads the original model weights.
+2. Patches attention `forward` methods in memory.
+3. Lets Hugging Face `generate(...)` create a normal KV cache.
+4. Rotates/processes K/V tensors with OScaR.
+5. Quantizes cached K/V tensors after attention uses them.
+
+This returns an **in-memory patched model object**. It does not create a
+standalone `.safetensors` file.
+
+TorchAO `.safetensors` export:
+
+1. Loads the original model weights.
+2. Applies TorchAO weight quantization through Transformers.
+3. Saves a Hugging Face-compatible model directory.
+4. Writes one or more `.safetensors` files.
+
+This creates **persistent quantized model weight files**. It is not OScaR KV
+cache compression.
+
+## Where The Gemma4 OScaR Code Lives
+
+The Gemma4 runtime patch is here:
 
 ```text
-artifacts/granite-4.0-1b-base-int4/
-  config.json
-  generation_config.json
-  model.safetensors
-  tokenizer.json
-  tokenizer_config.json
-  special_tokens_map.json
+src/oscar_quant/gemma4_patch.py
 ```
 
-Depending on `--max-shard-size`, the model may be saved as multiple shard files
-instead:
+The high-level Gemma4 loader is here:
 
 ```text
-model-00001-of-00002.safetensors
-model-00002-of-00002.safetensors
-model.safetensors.index.json
+src/oscar_quant/loader.py
 ```
 
-Both forms are normal Hugging Face `save_pretrained` outputs.
+Use this Python API:
 
-The exporter prints a JSON manifest to stdout:
+```python
+from oscar_quant import OscarKVConfig, load_oscar_patched_gemma4
 
-```json
-{
-  "model_id": "ibm-granite/granite-4.0-1b-base",
-  "output_dir": "/absolute/path/artifacts/granite-4.0-1b-base-int4",
-  "quantization": "int4_weight_only",
-  "group_size": 128,
-  "dtype": "bfloat16",
-  "device_map": "auto",
-  "max_shard_size": "10GB",
-  "safetensors_files": [
-    {
-      "path": "model.safetensors",
-      "size_bytes": 123456789
-    }
-  ]
-}
+patched_gemma = load_oscar_patched_gemma4(
+    kv_config=OscarKVConfig(k_bits=2, v_bits=2),
+    torch_dtype="auto",
+    device_map="auto",
+)
+
+print(patched_gemma.patched_attention_layers)
+print(patched_gemma.generate_text("Explain KV-cache quantization in one sentence.", max_new_tokens=64))
 ```
 
-The numbers above are examples. Your file sizes depend on the quantization
-method and shard size.
+What happens under the hood:
 
-## Important Concept
+- Source Gemma4 text attention layers own the K/V cache and run full OScaR
+  processing plus cache quantization.
+- Gemma4 shared-KV layers reuse source-layer K/V states and apply only the
+  query-side OScaR rotation, avoiding a double rotation of shared keys.
+- Gemma4 full/sliding attention mask routing remains controlled by
+  Transformers' Gemma4 model code.
 
-OScaR-KV-Quant and `.safetensors` weight quantization are not the same thing.
+## Setup
 
-OScaR-KV-Quant changes how the **runtime KV cache** is stored during generation.
-KV cache tensors are created from your prompt and generated tokens, so they are
-not part of the model checkpoint.
-
-The `.safetensors` exporter changes the **model weights** and saves those
-weights to disk. This project uses Hugging Face Transformers plus TorchAO for
-that file-producing path.
-
-In short:
-
-- Use `granite-quantize-weights` when you want `.safetensors` files.
-- Use `load_oscar_patched_granite(...)` when you want runtime OScaR KV-cache
-  quantization.
-- Treat combining saved weight quantization and OScaR KV-cache quantization as
-  an advanced follow-up that should be tested for your exact hardware and
-  Transformers/TorchAO versions.
-
-## Baseline Model
-
-This repo is baselined on:
-
-- Model: `ibm-granite/granite-4.0-1b-base`
-- Hugging Face architecture: `GraniteMoeHybridForCausalLM`
-- Attention class: `GraniteMoeHybridAttention`
-- Python: 3.12+
-
-The OScaR runtime path also keeps compatibility hooks for older transformer-style
-Granite attention exposed as `GraniteAttention`.
-
-## Requirements
-
-You need:
-
-- Python 3.12+
-- `git`
-- Enough disk space for the original Granite model and the saved quantized
-  artifact
-- `torch`, `transformers`, `torchao`, and `safetensors`
-- Optional: a Hugging Face token if model downloads require authentication in
-  your environment
-
-For the OScaR runtime path, use a Linux machine with an NVIDIA CUDA GPU because
-upstream OScaR builds CUDA extensions.
-
-The `.safetensors` weight artifact path uses TorchAO. Hardware support depends
-on the selected TorchAO quantization method and your installed PyTorch/TorchAO
-versions.
-
-## Setup For `.safetensors` Output
-
-From a fresh shell:
+From this repo:
 
 ```bash
 cd /Users/suneel.marti/opensourceprojects/oscar-granite-kv-quant
@@ -145,32 +103,122 @@ source .venv/bin/activate
 uv pip install -e ".[artifact]"
 ```
 
-Check that this package imports:
+Check the package import without downloading a model:
 
 ```bash
-python -c "from granite_oscar_quant import ArtifactQuantizationConfig; print(ArtifactQuantizationConfig())"
+python -c "from oscar_quant import OscarKVConfig; print(OscarKVConfig())"
 ```
 
-That command does not download Granite. It only confirms that your Python
-environment can see this package.
+## Install OScaR Runtime Dependency
 
-## Optional Hugging Face Login
-
-If model download fails with an authentication or gated-model error, log in:
+Runtime KV-cache patching needs upstream OScaR:
 
 ```bash
-huggingface-cli login
+bash scripts/install_oscar_dependency.sh
 ```
 
-Then rerun the command that failed. Hugging Face will cache downloaded model
-files on your machine, so the first run is usually the slowest.
+That script clones upstream OScaR into `third_party/OScaR-KV-Quant`, initializes
+its submodules, installs the CUDA PyTorch wheel used by OScaR, and installs
+OScaR editable into the active environment.
+
+Use a Linux machine with an NVIDIA CUDA GPU for the OScaR runtime path because
+upstream OScaR builds CUDA extensions.
+
+## Run OScaR Generation
+
+Granite:
+
+```bash
+oscar-generate \
+  --profile granite-4.0-1b-base \
+  --prompt "Explain KV-cache quantization in one paragraph." \
+  --max-new-tokens 128 \
+  --k-bits 2 \
+  --v-bits 2
+```
+
+Gemma4-E2B:
+
+```bash
+oscar-generate \
+  --profile gemma4-e2b \
+  --prompt "Explain KV-cache quantization in one paragraph." \
+  --max-new-tokens 128 \
+  --k-bits 2 \
+  --v-bits 2
+```
+
+Expected stderr:
+
+```text
+patched_gemma4-e2b_attention_layers=<positive integer>
+```
+
+Expected stdout:
+
+```text
+<generated model text>
+```
+
+## Python API For Runtime OScaR
+
+Granite:
+
+```python
+from oscar_quant import OscarKVConfig, load_oscar_patched_granite
+
+patched_granite = load_oscar_patched_granite(
+    kv_config=OscarKVConfig(k_bits=2, v_bits=2),
+    torch_dtype="auto",
+    device_map="auto",
+)
+
+text = patched_granite.generate_text(
+    "Explain OScaR KV-cache quantization in one sentence.",
+    max_new_tokens=64,
+)
+print(text)
+```
+
+Gemma4-E2B:
+
+```python
+from oscar_quant import OscarKVConfig, load_oscar_patched_gemma4
+
+patched_gemma = load_oscar_patched_gemma4(
+    kv_config=OscarKVConfig(k_bits=2, v_bits=2),
+    torch_dtype="auto",
+    device_map="auto",
+)
+
+text = patched_gemma.generate_text(
+    "Explain OScaR KV-cache quantization in one sentence.",
+    max_new_tokens=64,
+)
+print(text)
+```
+
+The returned wrapper has:
+
+- `model_id`: selected Hugging Face model id.
+- `model`: patched Hugging Face model object.
+- `tokenizer` for Granite or `processor` for Gemma4.
+- `kv_config`: validated `OscarKVConfig`.
+- `patched_attention_layers`: number of attention modules patched.
 
 ## Create Quantized `.safetensors`
 
-Recommended first artifact run:
+Install the artifact extra first:
 
 ```bash
-granite-quantize-weights \
+python -m pip install -e ".[artifact]"
+```
+
+Granite INT4:
+
+```bash
+oscar-quantize-weights \
+  --profile granite-4.0-1b-base \
   --output-dir artifacts/granite-4.0-1b-base-int4 \
   --quantization int4_weight_only \
   --group-size 128 \
@@ -179,17 +227,68 @@ granite-quantize-weights \
   --max-shard-size 10GB
 ```
 
+Gemma4-E2B INT4:
+
+```bash
+oscar-quantize-weights \
+  --profile gemma4-e2b \
+  --output-dir artifacts/gemma-4-e2b-int4 \
+  --quantization int4_weight_only \
+  --group-size 128 \
+  --dtype bfloat16 \
+  --device-map auto \
+  --max-shard-size 10GB
+```
+
+`model-quantize-weights` is the same exporter under a generic alias.
+
 Available quantization methods:
 
 - `int4_weight_only`
 - `int8_weight_only`
 - `int8_dynamic_activation_int8_weight`
 
-The default is `int4_weight_only`.
+The exporter prints a JSON report like:
 
-## Load The Saved Artifact
+```json
+{
+  "profile": "gemma4-e2b",
+  "model_id": "google/gemma-4-E2B",
+  "auto_model_class": "image-text-to-text",
+  "output_dir": "/absolute/path/artifacts/gemma-4-e2b-int4",
+  "quantization": "int4_weight_only",
+  "group_size": 128,
+  "dtype": "bfloat16",
+  "device_map": "auto",
+  "max_shard_size": "10GB",
+  "safetensors_files": [
+    {
+      "path": "model.safetensors",
+      "size_bytes": 123456789
+    }
+  ]
+}
+```
 
-After export, load the saved model directory with Transformers:
+Depending on `--max-shard-size`, the model may be saved as one file:
+
+```text
+model.safetensors
+```
+
+Or multiple shards:
+
+```text
+model-00001-of-00002.safetensors
+model-00002-of-00002.safetensors
+model.safetensors.index.json
+```
+
+Both forms are normal Hugging Face `save_pretrained` outputs.
+
+## Load A Saved Artifact
+
+Granite:
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -204,19 +303,32 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 ```
 
+Gemma4-E2B:
+
+```python
+from transformers import AutoModelForImageTextToText, AutoProcessor
+
+artifact_dir = "artifacts/gemma-4-e2b-int4"
+
+processor = AutoProcessor.from_pretrained(artifact_dir)
+model = AutoModelForImageTextToText.from_pretrained(
+    artifact_dir,
+    device_map="auto",
+    torch_dtype="auto",
+)
+```
+
 TorchAO must be installed in the environment that loads the quantized artifact.
 
 ## Python API For `.safetensors`
 
 ```python
-from granite_oscar_quant import (
-    ArtifactQuantizationConfig,
-    quantize_granite_to_safetensors,
-)
+from oscar_quant import ArtifactQuantizationConfig, quantize_model_to_safetensors
 
-report = quantize_granite_to_safetensors(
+report = quantize_model_to_safetensors(
     ArtifactQuantizationConfig(
-        output_dir="artifacts/granite-4.0-1b-base-int4",
+        profile="gemma4-e2b",
+        output_dir="artifacts/gemma-4-e2b-int4",
         quantization="int4_weight_only",
         group_size=128,
         dtype="bfloat16",
@@ -229,76 +341,16 @@ print(report.output_dir)
 print(report.safetensors_files)
 ```
 
-`quantize_granite_to_safetensors(...)` returns a `QuantizedArtifactReport`
-Pydantic object that lists the saved `.safetensors` files.
+`quantize_granite_to_safetensors(...)` remains available as a
+backward-compatible Granite wrapper.
 
-## OScaR Runtime KV-Cache Path
+## Benchmark Granite
 
-Install the OScaR runtime dependencies only if you also want runtime KV-cache
-quantization:
-
-```bash
-bash scripts/install_oscar_dependency.sh
-```
-
-The script clones upstream OScaR into `third_party/OScaR-KV-Quant`, initializes
-its submodules, installs the CUDA PyTorch wheel used by OScaR, and installs
-OScaR editable into the active environment.
-
-Run one generation request through the OScaR-patched model:
+The baseline benchmark currently compares Granite vanilla generation against
+Granite OScaR generation:
 
 ```bash
-granite-oscar-generate \
-  --prompt "Explain KV-cache quantization in one paragraph." \
-  --max-new-tokens 128 \
-  --k-bits 2 \
-  --v-bits 2
-```
-
-Expected stderr:
-
-```text
-patched_granite_attention_layers=<positive integer>
-```
-
-Expected stdout:
-
-```text
-<generated text from Granite>
-```
-
-## Python API For OScaR Runtime Patching
-
-```python
-from granite_oscar_quant import OscarKVConfig, load_oscar_patched_granite
-
-patched_granite = load_oscar_patched_granite(
-    kv_config=OscarKVConfig(k_bits=2, v_bits=2),
-    torch_dtype="auto",
-    device_map="auto",
-)
-
-# This is an in-memory OScaR KV-patched Granite model object.
-model = patched_granite.model
-tokenizer = patched_granite.tokenizer
-
-text = patched_granite.generate_text(
-    "Explain KV-cache quantization in one sentence.",
-    max_new_tokens=64,
-)
-print(text)
-```
-
-This path does not save quantized weights. It patches runtime attention/cache
-behavior.
-
-## Baseline Benchmark
-
-Run a before/after comparison between vanilla generation and OScaR KV-cache
-quantized generation:
-
-```bash
-granite-oscar-baseline \
+oscar-baseline \
   --prompt "The capital of France is" \
   --max-new-tokens 64 \
   --k-bits 2 \
@@ -310,57 +362,46 @@ text, and CUDA peak memory when CUDA is available.
 
 ## Important CLI Options
 
-For `.safetensors` artifacts:
+For runtime OScaR generation:
 
-- `--output-dir`: where to save the quantized model directory.
-- `--quantization`: `int4_weight_only`, `int8_weight_only`, or
-  `int8_dynamic_activation_int8_weight`.
-- `--group-size`: group size for INT4 weight-only quantization.
-- `--dtype`: one of `auto`, `bfloat16`, `float16`, or `float32`.
-- `--device-map`: passed to Hugging Face model loading. Defaults to `auto`.
-- `--max-shard-size`: passed to `save_pretrained`. Use a large value like
-  `10GB` if you want a single `model.safetensors` when possible.
-
-For OScaR runtime generation:
-
+- `--profile`: `granite-4.0-1b-base` or `gemma4-e2b`.
+- `--model-id`: optional override for the profile model id.
 - `--k-bits` and `--v-bits`: key/value cache quantization bit widths.
 - `--k-groupsize` and `--v-groupsize`: KV-cache quantization group sizes.
 - `--max-new-tokens`: number of tokens to generate.
 - `--temperature`: `0.0` means greedy decoding; values above zero enable
   sampling.
+- `--device-map`: passed to Hugging Face model loading. Defaults to `auto`.
+- `--dtype`: one of `auto`, `bfloat16`, `float16`, or `float32`.
 
-## How The Two Paths Work
+For `.safetensors` artifacts:
 
-Weight artifact path:
-
-1. Load Granite with Transformers.
-2. Apply TorchAO weight quantization through `TorchAoConfig`.
-3. Save with `model.save_pretrained(..., safe_serialization=True)`.
-4. Save tokenizer files with `tokenizer.save_pretrained(...)`.
-5. Print a report listing generated `.safetensors` files.
-
-OScaR runtime path:
-
-1. Load Granite with Transformers.
-2. Find supported Granite attention modules.
-3. Replace each attention module's `forward` method with an OScaR-aware eager
-   attention implementation.
-4. During generation, quantize the runtime KV cache.
-5. Keep using normal Hugging Face `model.generate(...)`.
+- `--profile`: `granite-4.0-1b-base` or `gemma4-e2b`.
+- `--model-id`: optional override for the profile model id.
+- `--auto-model-class`: optional override, `causal-lm` or
+  `image-text-to-text`.
+- `--output-dir`: where to save the quantized model directory.
+- `--quantization`: `int4_weight_only`, `int8_weight_only`, or
+  `int8_dynamic_activation_int8_weight`.
+- `--group-size`: group size for INT4 weight-only quantization.
+- `--max-shard-size`: passed to `save_pretrained`. Use a large value like
+  `10GB` if you want a single `model.safetensors` when possible.
 
 ## Project Layout
 
 ```text
-src/granite_oscar_quant/
-  __init__.py       Public package exports
-  artifact.py       Quantized .safetensors weight artifact exporter
-  benchmark.py      Baseline vs OScaR benchmark CLI
-  cli.py            Single OScaR generation CLI
-  config.py         Pydantic OScaR KV config
-  granite_patch.py  Runtime Granite attention patch
-  loader.py         High-level patched Granite model loader
-  models.py         Default model id
-  schemas.py        Pydantic benchmark result schemas
+src/oscar_quant/
+  __init__.py        Public package exports
+  artifact.py        Shared quantized .safetensors weight artifact exporter
+  benchmark.py       Baseline vs OScaR benchmark CLI for Granite
+  cli.py             Runtime OScaR generation CLI for Granite and Gemma4
+  config.py          Pydantic OScaR KV config
+  gemma4_patch.py    Runtime Gemma4 text attention patch
+  granite_patch.py   Runtime Granite attention patch
+  kv_cache_utils.py  Shared OScaR/cache helper functions
+  loader.py          High-level patched model loaders
+  models.py          Shared Granite/Gemma model profiles
+  schemas.py         Pydantic benchmark result schemas
 
 scripts/
   install_oscar_dependency.sh
@@ -371,9 +412,39 @@ tests/
 
 ## Troubleshooting
 
+### `ModuleNotFoundError: No module named 'kv_cache_compression'`
+
+This affects only runtime OScaR generation. Install OScaR:
+
+```bash
+bash scripts/install_oscar_dependency.sh
+```
+
+### No Gemma4 attention modules were found
+
+Install or upgrade Transformers to a release with Gemma4 support:
+
+```bash
+python -m pip install --upgrade "transformers>=5.5"
+```
+
+Then make sure the model id is Gemma4, for example:
+
+```bash
+oscar-generate --profile gemma4-e2b --prompt "Hello"
+```
+
+### Missing `AutoModelForImageTextToText`
+
+Gemma4-E2B uses the image-text-to-text auto class. Upgrade Transformers:
+
+```bash
+python -m pip install --upgrade "transformers>=5.5"
+```
+
 ### `ModuleNotFoundError: No module named 'torchao'`
 
-Install the artifact extra:
+This affects only `.safetensors` artifact export. Install the artifact extra:
 
 ```bash
 python -m pip install -e ".[artifact]"
@@ -394,35 +465,23 @@ TorchAO backend you choose may have hardware-specific requirements.
 
 Try:
 
-- Use a smaller model.
 - Use `--device-map auto`.
 - Use `--dtype float16` or `--dtype bfloat16`.
 - Close other GPU workloads.
 - Export on a larger GPU machine.
-
-### `ModuleNotFoundError: No module named 'kv_cache_compression'`
-
-This only affects the OScaR runtime path. Install OScaR:
-
-```bash
-bash scripts/install_oscar_dependency.sh
-```
-
-### `No supported Granite attention modules were found`
-
-This only affects the OScaR runtime path. The loaded model did not contain
-`GraniteMoeHybridAttention` or `GraniteAttention` modules. Make sure you are
-using a supported Granite model and a recent enough Transformers version.
+- Try Granite before Gemma if you only want to test the pipeline.
 
 ## Source References
 
 - IBM Granite 4.0 1B Base model card:
   https://huggingface.co/ibm-granite/granite-4.0-1b-base
-- Granite 4.0 1B Base config:
-  https://huggingface.co/ibm-granite/granite-4.0-1b-base/blob/main/config.json
+- Google Gemma4-E2B model card:
+  https://huggingface.co/google/gemma-4-E2B
+- Hugging Face Gemma4 docs:
+  https://huggingface.co/docs/transformers/v5.8.1/model_doc/gemma4
+- Hugging Face Gemma4 model source:
+  https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py
 - Hugging Face TorchAO quantization docs:
   https://huggingface.co/docs/transformers/main/quantization/torchao
-- Hugging Face GraniteMoeHybrid docs:
-  https://huggingface.co/docs/transformers/en/model_doc/granitemoehybrid
 - OScaR-KV-Quant:
   https://github.com/ZunhaiSu/OScaR-KV-Quant

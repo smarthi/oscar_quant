@@ -42,7 +42,7 @@ class BenchmarkRun(BaseModel):
 
 
 class BenchmarkReport(BaseModel):
-    """Top-level JSON payload emitted by `granite-oscar-baseline`.
+    """Top-level JSON payload emitted by `oscar-baseline`.
 
     What it does:
         Wraps model identity, prompt length, KV quantization bit widths, and a

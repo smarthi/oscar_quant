@@ -9,15 +9,19 @@ import json
 
 from pydantic import ValidationError
 
-from granite_oscar_quant.artifact import (
+from oscar_quant.artifact import (
     ArtifactQuantizationConfig,
     QuantizedArtifactReport,
     SafetensorFile,
 )
-from granite_oscar_quant.config import OscarKVConfig
-from granite_oscar_quant.loader import OscarPatchedGraniteModel
-from granite_oscar_quant.models import DEFAULT_GRANITE_MODEL_ID
-from granite_oscar_quant.schemas import BenchmarkReport, BenchmarkRun
+from oscar_quant.config import OscarKVConfig
+from oscar_quant.loader import OscarPatchedGemma4Model, OscarPatchedGraniteModel
+from oscar_quant.models import (
+    DEFAULT_GEMMA4_E2B_MODEL_ID,
+    DEFAULT_GRANITE_MODEL_ID,
+    MODEL_PROFILES,
+)
+from oscar_quant.schemas import BenchmarkReport, BenchmarkRun
 
 
 def test_default_config_validates_and_exports_namespace():
@@ -115,10 +119,60 @@ def test_artifact_config_defaults_to_quantized_safetensors_output():
     patching, so this test protects the default weight artifact config.
     """
     config = ArtifactQuantizationConfig()
+    profile = config.resolved_profile()
 
-    assert config.model_id == DEFAULT_GRANITE_MODEL_ID
+    assert profile.model_id == DEFAULT_GRANITE_MODEL_ID
+    assert profile.auto_model_class == "causal-lm"
     assert config.quantization == "int4_weight_only"
     assert config.group_size == 128
+
+
+def test_gemma4_e2b_profile_uses_image_text_to_text_loader_and_oscar_patch():
+    """Verify Gemma4-E2B has shared profile and runtime OScaR support.
+
+    Gemma4-E2B uses its own attention patch rather than the Granite patch, and
+    it should still use the same `.safetensors` artifact machinery through its
+    own model profile.
+    """
+    profile = MODEL_PROFILES["gemma4-e2b"]
+    config = ArtifactQuantizationConfig(profile="gemma4-e2b")
+
+    assert profile.model_id == DEFAULT_GEMMA4_E2B_MODEL_ID
+    assert profile.auto_model_class == "image-text-to-text"
+    assert profile.supports_oscar_kv_cache is True
+    assert config.resolved_output_dir().as_posix() == "artifacts/gemma-4-e2b-int4"
+
+
+def test_patched_gemma4_wrapper_identifies_model_output():
+    """Verify the Gemma4 loader output schema represents a patched model.
+
+    The real loader downloads Gemma4 and applies OScaR. This lightweight test
+    uses placeholder objects to protect the shape of the returned wrapper
+    without requiring a model download.
+    """
+    wrapped = OscarPatchedGemma4Model(
+        model_id=DEFAULT_GEMMA4_E2B_MODEL_ID,
+        model=object(),
+        processor=object(),
+        kv_config=OscarKVConfig(),
+        patched_attention_layers=26,
+    )
+
+    assert wrapped.model_id == DEFAULT_GEMMA4_E2B_MODEL_ID
+    assert wrapped.patched_attention_layers == 26
+    assert wrapped.kv_config.v_bits == 2
+
+
+def test_kv_cache_utils_is_the_shared_helper_module():
+    """Verify the shared OScaR/cache helper module uses the expected name.
+
+    The Gemma4 and Granite runtime patches both import `kv_cache_utils`, so this
+    protects the clearer filename that users naturally look for.
+    """
+    from oscar_quant import kv_cache_utils
+
+    assert hasattr(kv_cache_utils, "ensure_oscar_quantizer")
+    assert hasattr(kv_cache_utils, "quantize_layer_cache_after_attention")
 
 
 def test_quantized_artifact_report_lists_safetensor_files():
@@ -128,7 +182,9 @@ def test_quantized_artifact_report_lists_safetensor_files():
     lightweight test protects the JSON shape without loading Granite.
     """
     report = QuantizedArtifactReport(
+        profile="granite-4.0-1b-base",
         model_id=DEFAULT_GRANITE_MODEL_ID,
+        auto_model_class="causal-lm",
         output_dir="/tmp/granite-int4",
         quantization="int4_weight_only",
         group_size=128,
