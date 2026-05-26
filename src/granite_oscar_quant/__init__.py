@@ -13,7 +13,9 @@ __all__ = [
     "BenchmarkReport",
     "BenchmarkRun",
     "OscarKVConfig",
+    "OscarPatchedGraniteModel",
     "apply_oscar_to_granite",
+    "load_oscar_patched_granite",
     "restore_granite_attention",
 ]
 
@@ -22,8 +24,8 @@ def __getattr__(name: str):
     """Lazily import torch-backed patch helpers.
 
     What it does:
-        Resolves `apply_oscar_to_granite` and `restore_granite_attention` on
-        demand from `granite_patch`.
+        Resolves torch-backed patch helpers and the high-level patched-model
+        loader only when those names are requested.
 
     Why it exists:
         Importing the patch module imports torch and later touches Hugging Face
@@ -33,8 +35,8 @@ def __getattr__(name: str):
 
     How it helps:
         Downstream code can use `from granite_oscar_quant import OscarKVConfig`
-        without paying the model-runtime import cost, while still getting a
-        convenient package-root import for the patching entry points.
+        without paying the model-runtime import cost, while still getting
+        convenient package-root imports for the patched-model entry points.
     """
     if name in {"apply_oscar_to_granite", "restore_granite_attention"}:
         from .granite_patch import apply_oscar_to_granite, restore_granite_attention
@@ -42,5 +44,12 @@ def __getattr__(name: str):
         return {
             "apply_oscar_to_granite": apply_oscar_to_granite,
             "restore_granite_attention": restore_granite_attention,
+        }[name]
+    if name in {"OscarPatchedGraniteModel", "load_oscar_patched_granite"}:
+        from .loader import OscarPatchedGraniteModel, load_oscar_patched_granite
+
+        return {
+            "OscarPatchedGraniteModel": OscarPatchedGraniteModel,
+            "load_oscar_patched_granite": load_oscar_patched_granite,
         }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

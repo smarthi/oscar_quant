@@ -10,6 +10,7 @@ import json
 from pydantic import ValidationError
 
 from granite_oscar_quant.config import OscarKVConfig
+from granite_oscar_quant.loader import OscarPatchedGraniteModel
 from granite_oscar_quant.models import DEFAULT_GRANITE_MODEL_ID
 from granite_oscar_quant.schemas import BenchmarkReport, BenchmarkRun
 
@@ -80,3 +81,23 @@ def test_benchmark_report_serializes_as_json():
 
     assert payload["model_id"] == DEFAULT_GRANITE_MODEL_ID
     assert payload["runs"][0]["label"] == "baseline"
+
+
+def test_patched_granite_wrapper_identifies_model_output():
+    """Verify the loader output schema represents the patched model object.
+
+    The real loader downloads weights and applies OScaR. This lightweight test
+    uses placeholder objects to protect the shape of the returned wrapper
+    without requiring a model download.
+    """
+    wrapped = OscarPatchedGraniteModel(
+        model_id=DEFAULT_GRANITE_MODEL_ID,
+        model=object(),
+        tokenizer=object(),
+        kv_config=OscarKVConfig(),
+        patched_attention_layers=24,
+    )
+
+    assert wrapped.model_id == DEFAULT_GRANITE_MODEL_ID
+    assert wrapped.patched_attention_layers == 24
+    assert wrapped.kv_config.k_bits == 2

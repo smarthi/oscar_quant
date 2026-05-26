@@ -89,28 +89,39 @@ python -m granite_oscar_quant.cli \
   --prompt "Write a concise Granite deployment checklist."
 ```
 
+The generation command prints generated text to stdout. The patched Granite
+model itself is an in-memory object; use the Python API below when you want that
+object as the output.
+
 ## Python API
 
 ```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from granite_oscar_quant import OscarKVConfig, load_oscar_patched_granite
 
-from granite_oscar_quant import OscarKVConfig, apply_oscar_to_granite
-
-model_id = "ibm-granite/granite-4.0-1b-base"
-tokenizer = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
+patched_granite = load_oscar_patched_granite(
+    kv_config=OscarKVConfig(k_bits=2, v_bits=2, k_groupsize=32, v_groupsize=32),
     torch_dtype="auto",
     device_map="auto",
-    attn_implementation="eager",
 )
 
-patched_layers = apply_oscar_to_granite(
-    model,
-    OscarKVConfig(k_bits=2, v_bits=2, k_groupsize=32, v_groupsize=32),
+print(patched_granite.model_id)
+print(patched_granite.patched_attention_layers)
+
+# This is the OScaR KV-patched Granite Hugging Face model object.
+model = patched_granite.model
+tokenizer = patched_granite.tokenizer
+
+text = patched_granite.generate_text(
+    "Explain KV-cache quantization in one sentence.",
+    max_new_tokens=64,
 )
-print(f"Patched {patched_layers} Granite attention layers")
+print(text)
 ```
+
+`load_oscar_patched_granite(...)` returns an `OscarPatchedGraniteModel`
+Pydantic wrapper. Its `model` field is the loaded Granite model with supported
+attention layers patched for OScaR KV-cache quantization. The patch is runtime
+behavior, so it is not saved as new model weights.
 
 ## Notes
 

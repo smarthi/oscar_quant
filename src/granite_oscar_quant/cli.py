@@ -13,10 +13,9 @@ import sys
 from typing import Any
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .config import OscarKVConfig
-from .granite_patch import apply_oscar_to_granite
+from .loader import load_oscar_patched_granite
 from .models import DEFAULT_GRANITE_MODEL_ID
 
 
@@ -41,54 +40,39 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     dtype = _dtype(args.dtype)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_id,
-        trust_remote_code=args.trust_remote_code,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
+    patched_granite = load_oscar_patched_granite(
         args.model_id,
         torch_dtype=dtype,
         device_map=args.device_map,
         attn_implementation="eager",
         trust_remote_code=args.trust_remote_code,
+        kv_config=_oscar_config(args),
     )
-
-    patched_layers = apply_oscar_to_granite(model, _oscar_config(args))
-    print(f"patched_granite_attention_layers={patched_layers}", file=sys.stderr)
+    print(
+        f"patched_granite_attention_layers={patched_granite.patched_attention_layers}",
+        file=sys.stderr,
+    )
 
     prompt = args.prompt
     if args.chat_template:
-        prompt = tokenizer.apply_chat_template(
+        prompt = patched_granite.tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
         )
-
-    inputs = tokenizer(prompt, return_tensors="pt")
-    inputs = {name: tensor.to(model.device) for name, tensor in inputs.items()}
-
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     generate_kwargs: dict[str, Any] = {
         "max_new_tokens": args.max_new_tokens,
         "do_sample": args.temperature > 0,
         "temperature": args.temperature if args.temperature > 0 else None,
         "top_p": args.top_p,
-        "use_cache": True,
-        "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id,
     }
     generate_kwargs = {key: value for key, value in generate_kwargs.items() if value is not None}
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    with torch.inference_mode():
-        generated = model.generate(**inputs, **generate_kwargs)
-
-    new_tokens = generated[:, inputs["input_ids"].shape[-1] :]
-    print(tokenizer.decode(new_tokens[0], skip_special_tokens=True))
+    print(patched_granite.generate_text(prompt, **generate_kwargs))
 
     if torch.cuda.is_available():
         peak_gib = torch.cuda.max_memory_allocated() / 1024**3
